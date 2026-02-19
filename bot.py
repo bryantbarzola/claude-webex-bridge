@@ -157,6 +157,89 @@ async def handle_start(api: WebexAPI, room_id: str) -> None:
     )
 
 
+def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
+    """Build an Adaptive Card JSON for the session list."""
+    body: list[dict] = [
+        {
+            "type": "TextBlock",
+            "text": "Recent Sessions",
+            "size": "Medium",
+            "weight": "Bolder",
+        }
+    ]
+
+    for i, s in enumerate(sessions, 1):
+        label = s.display if s.display else s.session_id[:12]
+        path = _short_path(s.cwd)
+        ago = _relative_time(s.timestamp)
+
+        body.append(
+            {
+                "type": "Container",
+                "separator": True,
+                "items": [
+                    {
+                        "type": "ColumnSet",
+                        "columns": [
+                            {
+                                "type": "Column",
+                                "width": "auto",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": str(i),
+                                        "weight": "Bolder",
+                                    }
+                                ],
+                            },
+                            {
+                                "type": "Column",
+                                "width": "stretch",
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": label,
+                                        "wrap": True,
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": f"{path} \u00b7 {ago}",
+                                        "size": "Small",
+                                        "isSubtle": True,
+                                        "spacing": "None",
+                                    },
+                                ],
+                            },
+                        ],
+                    }
+                ],
+            }
+        )
+
+    body.append(
+        {
+            "type": "Container",
+            "separator": True,
+            "style": "accent",
+            "items": [
+                {
+                    "type": "TextBlock",
+                    "text": "Reply with `/connect N` to connect to a session",
+                    "weight": "Bolder",
+                    "wrap": True,
+                }
+            ],
+        }
+    )
+
+    return {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.2",
+        "body": body,
+    }
+
+
 async def handle_sessions(api: WebexAPI, room_id: str) -> None:
     state = get_state(room_id)
     # Fetch extra sessions to account for filtered ones
@@ -172,20 +255,23 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
     if not filtered:
         filtered = all_sessions
 
-    # Limit to 10 for display
-    filtered = filtered[:10]
+    # Limit to 5 for display
+    filtered = filtered[:5]
     state.pending_sessions = filtered
 
-    lines = ["**Recent Sessions**\n"]
+    # Build fallback text for clients without card support
+    lines = ["Recent Sessions\n"]
     for i, s in enumerate(filtered, 1):
         label = s.display if s.display else s.session_id[:12]
         path = _short_path(s.cwd)
         ago = _relative_time(s.timestamp)
-        lines.append(f"**{i}.** {label}")
-        lines.append(f"  `{path}` · {ago}\n")
+        lines.append(f"{i}. {label}")
+        lines.append(f"   {path} \u00b7 {ago}\n")
+    lines.append("Use /connect N to connect to a session.")
+    fallback_text = "\n".join(lines)
 
-    lines.append("Use `/connect N` to connect to a session.")
-    await api.send_message(room_id, "\n".join(lines))
+    card = _build_sessions_card(filtered)
+    await api.send_card_message(room_id, card, fallback_text)
 
 
 async def handle_connect(api: WebexAPI, room_id: str, arg: str) -> None:

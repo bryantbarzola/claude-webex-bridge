@@ -103,6 +103,23 @@ class WebexAPI:
             json={"roomId": room_id, "markdown": text},
         )
 
+    async def send_card_message(self, room_id: str, card: dict, fallback_text: str) -> dict:
+        """Send a message with an Adaptive Card attachment."""
+        return await self._request(
+            "POST",
+            "/messages",
+            json={
+                "roomId": room_id,
+                "text": fallback_text,
+                "attachments": [
+                    {
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": card,
+                    }
+                ],
+            },
+        )
+
     async def edit_message(self, message_id: str, room_id: str, text: str) -> dict | None:
         """Edit an existing message. Returns None on failure (caller should fallback)."""
         try:
