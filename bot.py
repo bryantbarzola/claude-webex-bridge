@@ -215,14 +215,13 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
 
     for i, s in enumerate(sessions, 1):
         display = s.display if s.display else s.session_id[:12]
-        path = _short_path(s.cwd)
         ago = _relative_time(s.timestamp)
 
         # Truncate display text to keep rows compact
         if len(display) > 60:
             display = display[:57] + "..."
 
-        # Right column: conversation snippet (primary), path · time (secondary)
+        # Right column: conversation snippet (primary), session ID · time (secondary)
         right_items: list[dict] = [
             {
                 "type": "TextBlock",
@@ -232,7 +231,7 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
             },
             {
                 "type": "TextBlock",
-                "text": f"{path} \u00b7 {ago}",
+                "text": f"{s.session_id} \u00b7 {ago}",
                 "size": "Small",
                 "isSubtle": True,
                 "spacing": "None",
@@ -320,10 +319,9 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
         display = s.display if s.display else s.session_id[:12]
         if len(display) > 60:
             display = display[:57] + "..."
-        path = _short_path(s.cwd)
         ago = _relative_time(s.timestamp)
         lines.append(f"**{i}.** {display}")
-        lines.append(f"   {path} \u00b7 {ago}\n")
+        lines.append(f"   {s.session_id} \u00b7 {ago}\n")
     lines.append("Reply `/resume N` to connect (e.g. `/resume 1`)")
     fallback_text = "\n".join(lines)
 
