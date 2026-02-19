@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 
 from auth import is_authorized
 from claude_cli import send_message as cli_send_message
-from config import POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES
+from config import POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
 from sessions import SessionInfo, get_session_by_id, list_recent_sessions
 from webex_api import WebexAPI
 
@@ -145,7 +145,8 @@ def _short_path(cwd: str) -> str:
 # Command handlers
 # ---------------------------------------------------------------------------
 
-async def handle_start(api: WebexAPI, room_id: str) -> None:
+def _build_welcome_card() -> tuple[dict, str]:
+    """Build the welcome Adaptive Card and fallback text."""
     commands = [
         ("/sessions", "List recent sessions"),
         ("/resume N", "Resume session N from the list"),
@@ -196,6 +197,11 @@ async def handle_start(api: WebexAPI, room_id: str) -> None:
         + "\n\nTip: Use `/resume` to jump straight into your latest session."
     )
 
+    return card, fallback
+
+
+async def handle_start(api: WebexAPI, room_id: str) -> None:
+    card, fallback = _build_welcome_card()
     await api.send_card_message(room_id, card, fallback)
 
     # Auto-send sessions list so user can immediately /resume
@@ -665,12 +671,33 @@ async def dispatch(api: WebexAPI, room_id: str, text: str) -> None:
 # Polling loop
 # ---------------------------------------------------------------------------
 
+async def _send_startup_welcome(api: WebexAPI) -> str | None:
+    """Send welcome card to the authorized user on startup. Returns the room ID or None."""
+    try:
+        card, fallback = _build_welcome_card()
+        result = await api.send_card_to_email(WEBEX_USER_EMAIL, card, fallback)
+        room_id = result.get("roomId")
+        if room_id:
+            logger.info("Sent startup welcome to %s (room=%s)", WEBEX_USER_EMAIL, room_id[:12])
+            # Also send sessions list into the same room
+            await handle_sessions(api, room_id)
+        return room_id
+    except Exception:
+        logger.exception("Failed to send startup welcome (will still poll normally)")
+        return None
+
+
 async def poll_loop(api: WebexAPI) -> None:
     """Poll Webex for new messages in direct rooms."""
     # Track the newest seen message ID per room to avoid replaying history
     last_seen: dict[str, str] = {}
     # Rooms we've initialized (first poll marks position, doesn't process)
     initialized_rooms: set[str] = set()
+
+    # Send welcome to the user proactively so they don't need to find the bot
+    startup_room = await _send_startup_welcome(api)
+    if startup_room:
+        initialized_rooms.add(startup_room)
 
     logger.info("Polling started (interval=%.1fs)", POLL_INTERVAL_SECONDS)
 

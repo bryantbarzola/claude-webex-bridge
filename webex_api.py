@@ -146,6 +146,23 @@ class WebexAPI:
             },
         )
 
+    async def send_card_to_email(self, email: str, card: dict, fallback_text: str) -> dict:
+        """Send a message with an Adaptive Card to a person by email (creates 1:1 room if needed)."""
+        return await self._request(
+            "POST",
+            "/messages",
+            json={
+                "toPersonEmail": email,
+                "text": fallback_text,
+                "attachments": [
+                    {
+                        "contentType": "application/vnd.microsoft.card.adaptive",
+                        "content": card,
+                    }
+                ],
+            },
+        )
+
     async def edit_message(self, message_id: str, room_id: str, text: str) -> dict | None:
         """Edit an existing message. Returns None on failure (caller should fallback)."""
         try:
