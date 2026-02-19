@@ -1,3 +1,24 @@
+# Environment and secrets
 .env
+
+# Python
 __pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+
+# Logs
 *.log
+
+# macOS
+.DS_Store
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code guidance (local only)
+CLAUDE.md
