@@ -208,9 +208,30 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
     ]
 
     for i, s in enumerate(sessions, 1):
-        label = s.display if s.display else s.session_id[:12]
+        display = s.display if s.display else s.session_id[:12]
         path = _short_path(s.cwd)
         ago = _relative_time(s.timestamp)
+
+        # Truncate display text to keep rows compact
+        if len(display) > 60:
+            display = display[:57] + "..."
+
+        # Right column: conversation snippet (primary), path · time (secondary)
+        right_items: list[dict] = [
+            {
+                "type": "TextBlock",
+                "text": display,
+                "weight": "Bolder",
+                "wrap": True,
+            },
+            {
+                "type": "TextBlock",
+                "text": f"{path} \u00b7 {ago}",
+                "size": "Small",
+                "isSubtle": True,
+                "spacing": "None",
+            },
+        ]
 
         body.append(
             {
@@ -223,10 +244,12 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
                             {
                                 "type": "Column",
                                 "width": "auto",
+                                "verticalContentAlignment": "Center",
                                 "items": [
                                     {
                                         "type": "TextBlock",
                                         "text": str(i),
+                                        "size": "Large",
                                         "weight": "Bolder",
                                     }
                                 ],
@@ -234,20 +257,7 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
                             {
                                 "type": "Column",
                                 "width": "stretch",
-                                "items": [
-                                    {
-                                        "type": "TextBlock",
-                                        "text": label,
-                                        "wrap": True,
-                                    },
-                                    {
-                                        "type": "TextBlock",
-                                        "text": f"{path} \u00b7 {ago}",
-                                        "size": "Small",
-                                        "isSubtle": True,
-                                        "spacing": "None",
-                                    },
-                                ],
+                                "items": right_items,
                             },
                         ],
                     }
@@ -263,7 +273,7 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
             "items": [
                 {
                     "type": "TextBlock",
-                    "text": "Reply with `/resume N` to resume a session",
+                    "text": "Reply `/resume N` to connect (e.g. `/resume 1`)",
                     "weight": "Bolder",
                     "wrap": True,
                 }
@@ -299,14 +309,16 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
     state.pending_sessions = filtered
 
     # Build fallback text for clients without card support
-    lines = ["Recent Sessions\n"]
+    lines = ["**Recent Sessions**\n"]
     for i, s in enumerate(filtered, 1):
-        label = s.display if s.display else s.session_id[:12]
+        display = s.display if s.display else s.session_id[:12]
+        if len(display) > 60:
+            display = display[:57] + "..."
         path = _short_path(s.cwd)
         ago = _relative_time(s.timestamp)
-        lines.append(f"{i}. {label}")
+        lines.append(f"**{i}.** {display}")
         lines.append(f"   {path} \u00b7 {ago}\n")
-    lines.append("Use /resume N to resume a session.")
+    lines.append("Reply `/resume N` to connect (e.g. `/resume 1`)")
     fallback_text = "\n".join(lines)
 
     card = _build_sessions_card(filtered)
