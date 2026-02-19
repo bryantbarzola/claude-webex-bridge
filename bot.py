@@ -30,6 +30,8 @@ class BotState:
     skip_permissions: bool = False
     pending_sessions: list[SessionInfo] = field(default_factory=list)
     processing: bool = False
+    _active_process: object = field(default=None, repr=False)
+    _thinking_id: str | None = field(default=None, repr=False)
 
 
 _room_states: dict[str, BotState] = {}
@@ -151,6 +153,7 @@ async def handle_start(api: WebexAPI, room_id: str) -> None:
         ("/disconnect", "Disconnect from session"),
         ("/status", "Show connection info"),
         ("/safe", "Toggle permission mode"),
+        ("/cancel", "Cancel a running command"),
     ]
 
     card = {
@@ -194,6 +197,9 @@ async def handle_start(api: WebexAPI, room_id: str) -> None:
     )
 
     await api.send_card_message(room_id, card, fallback)
+
+    # Auto-send sessions list so user can immediately /resume
+    await handle_sessions(api, room_id)
 
 
 def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
@@ -294,7 +300,7 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
     # Fetch extra sessions to account for filtered ones (run in thread to avoid blocking event loop)
     all_sessions = await asyncio.to_thread(list_recent_sessions, 20)
     if not all_sessions:
-        await api.send_message(room_id, "No recent sessions found.")
+        await api.send_message(room_id, "No recent sessions found. Make sure you've used Claude Code at least once.")
         return
 
     # Filter out sessions with useless display names
@@ -423,7 +429,7 @@ async def handle_disconnect(api: WebexAPI, room_id: str) -> None:
     state.session_id = None
     state.session_cwd = None
     state.session_label = ""
-    await api.send_message(room_id, f"Disconnected from: {label}")
+    await api.send_message(room_id, f"Disconnected from: {label}\n\nUse `/sessions` to connect to another session.")
 
 
 async def handle_status(api: WebexAPI, room_id: str) -> None:
@@ -505,36 +511,93 @@ async def handle_safe(api: WebexAPI, room_id: str) -> None:
     else:
         await api.send_message(
             room_id,
-            "**Mode: safe**\n"
-            "WARNING: In --print mode, Claude cannot prompt for interactive permission "
-            "approval. Commands requiring approval may cause the CLI to hang. "
-            "Use `/safe` again to switch back if this happens.",
+            "**Mode: safe**\n\n"
+            "> **Note:** Safe mode may cause commands to hang because approval prompts "
+            "can't be shown. Use `/safe` to switch back if this happens.",
         )
+
+
+def _format_elapsed(seconds: float) -> str:
+    """Format elapsed seconds as a compact string like '15s', '1m 30s', '5m'."""
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    remaining = s % 60
+    if remaining == 0:
+        return f"{m}m"
+    return f"{m}m {remaining}s"
+
+
+async def _update_thinking(api: WebexAPI, msg_id: str, room_id: str) -> None:
+    """Periodically update the 'Thinking...' message with elapsed time."""
+    start = time.monotonic()
+    try:
+        while True:
+            await asyncio.sleep(15)
+            elapsed = _format_elapsed(time.monotonic() - start)
+            await api.edit_message(msg_id, room_id, f"Thinking... ({elapsed})")
+    except asyncio.CancelledError:
+        pass
+
+
+async def handle_cancel(api: WebexAPI, room_id: str) -> None:
+    """Cancel the currently running CLI process."""
+    state = get_state(room_id)
+    if not state.processing:
+        await api.send_message(room_id, "Nothing to cancel.")
+        return
+
+    process = state._active_process
+    if process is not None:
+        try:
+            process.kill()
+            await process.wait()
+        except ProcessLookupError:
+            pass  # Already exited
+
+    # Edit thinking message to show cancellation
+    if state._thinking_id:
+        await api.edit_message(state._thinking_id, room_id, "Cancelled.")
+
+    state._active_process = None
+    state._thinking_id = None
+    state.processing = False
+    logger.info("Command cancelled by user in room %s", room_id[:12])
 
 
 async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
     """Forward a plain text message to the connected Claude session."""
     state = get_state(room_id)
     if state.session_id is None:
-        await api.send_message(room_id, "Not connected. Use `/sessions` to pick a session.")
+        await api.send_message(room_id, "Not connected to any session. Use `/sessions` to browse and connect.")
         return
 
     if state.processing:
-        await api.send_message(room_id, "Still processing the previous message. Please wait.")
+        await api.send_message(room_id, "**Still processing** the previous message. Please wait, or use `/cancel` to abort.")
         return
 
     state.processing = True
     thinking_id = None
+    updater_task = None
     try:
         # Send "Thinking..." placeholder
         thinking = await api.send_message(room_id, "Thinking...")
         thinking_id = thinking.get("id")
+        state._thinking_id = thinking_id
+
+        # Start progress updater
+        if thinking_id:
+            updater_task = asyncio.create_task(
+                _update_thinking(api, thinking_id, room_id)
+            )
 
         response = await cli_send_message(
             session_id=state.session_id,
             message=text,
             cwd=state.session_cwd,
             skip_permissions=state.skip_permissions,
+            on_process_started=lambda p: setattr(state, '_active_process', p),
         )
 
         chunks = split_message(response)
@@ -558,6 +621,10 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
         else:
             await api.send_message(room_id, error_text)
     finally:
+        if updater_task is not None:
+            updater_task.cancel()
+        state._active_process = None
+        state._thinking_id = None
         state.processing = False
 
 
@@ -572,6 +639,7 @@ COMMANDS = {
     "/disconnect": handle_disconnect,
     "/status": handle_status,
     "/safe": handle_safe,
+    "/cancel": handle_cancel,
 }
 
 

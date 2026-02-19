@@ -20,11 +20,12 @@ async def send_message(
     message: str,
     cwd: str,
     skip_permissions: bool = True,
+    on_process_started: object = None,
 ) -> str:
     """Send a message to a Claude Code session via CLI and return the response."""
     claude_path = shutil.which("claude")
     if claude_path is None:
-        return "Error: 'claude' CLI not found on PATH."
+        return "Error: 'claude' CLI not found on PATH. Make sure Claude Code is installed."
 
     cmd = [
         claude_path,
@@ -48,9 +49,12 @@ async def send_message(
             env=_clean_env(),
         )
     except FileNotFoundError:
-        return "Error: 'claude' CLI not found."
+        return "Error: 'claude' CLI not found on PATH. Make sure Claude Code is installed."
     except OSError as e:
         return f"Error starting CLI: {e}"
+
+    if on_process_started is not None:
+        on_process_started(process)
 
     try:
         stdout, stderr = await asyncio.wait_for(
@@ -66,7 +70,7 @@ async def send_message(
     stderr_text = stderr.decode("utf-8", errors="replace").strip()
 
     if process.returncode != 0:
-        error_msg = f"CLI exited with code {process.returncode}."
+        error_msg = f"Claude encountered an error (exit code {process.returncode}). Try sending your message again, or disconnect and reconnect."
         if stderr_text:
             # Log stderr server-side only (may contain secrets)
             logger.error("CLI stderr: %s", stderr_text[:1000])
@@ -75,6 +79,6 @@ async def send_message(
         return error_msg
 
     if not stdout_text:
-        return "(empty response)"
+        return "Claude completed the request but returned no output."
 
     return stdout_text
