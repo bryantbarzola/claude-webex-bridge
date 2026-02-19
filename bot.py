@@ -274,10 +274,64 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
     await api.send_card_message(room_id, card, fallback_text)
 
 
+async def _connect_to_session(api: WebexAPI, room_id: str, session: SessionInfo) -> None:
+    """Set state and send confirmation card for a connected session."""
+    state = get_state(room_id)
+    state.session_id = session.session_id
+    state.session_cwd = session.cwd
+    state.session_label = session.display or session.session_id[:12]
+
+    mode_label = "skip-permissions" if state.skip_permissions else "safe"
+    mode_desc = "Auto-approve tools" if state.skip_permissions else "Ask before tools"
+    path = _short_path(session.cwd)
+
+    card = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.2",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "\u2705 Connected",
+                "size": "Medium",
+                "weight": "Bolder",
+            },
+            {
+                "type": "FactSet",
+                "facts": [
+                    {"title": "Session", "value": state.session_label},
+                    {"title": "Directory", "value": path},
+                    {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
+                ],
+            },
+            {
+                "type": "TextBlock",
+                "text": "Send a message to interact with this session.",
+                "isSubtle": True,
+                "spacing": "Medium",
+            },
+        ],
+    }
+    fallback = (
+        f"**Connected to:** {state.session_label}\n"
+        f"**Directory:** {path}\n"
+        f"**Mode:** {mode_label}\n\n"
+        "Send a message to interact with this session."
+    )
+    await api.send_card_message(room_id, card, fallback)
+
+
 async def handle_connect(api: WebexAPI, room_id: str, arg: str) -> None:
     state = get_state(room_id)
+
+    # No argument: connect to the most recent session
     if not arg:
-        await api.send_message(room_id, "Usage: `/connect N` (run `/sessions` first)")
+        all_sessions = await asyncio.to_thread(list_recent_sessions, 5)
+        if not all_sessions:
+            await api.send_message(room_id, "No recent sessions found. Use Claude Code first, then try again.")
+            return
+        session = all_sessions[0]
+        await _connect_to_session(api, room_id, session)
         return
 
     try:
@@ -305,19 +359,7 @@ async def handle_connect(api: WebexAPI, room_id: str, arg: str) -> None:
         await api.send_message(room_id, "Session not found. It may have been deleted. Run `/sessions` again.")
         return
 
-    state.session_id = session.session_id
-    state.session_cwd = session.cwd
-    state.session_label = session.display or session.session_id[:12]
-
-    mode = "skip-permissions" if state.skip_permissions else "safe"
-    await api.send_message(
-        room_id,
-        f"**Connected to:** {state.session_label}\n"
-        f"**Project:** {session.project}\n"
-        f"**Working dir:** {session.cwd}\n"
-        f"**Mode:** {mode}\n\n"
-        "Send a message to interact with this session.",
-    )
+    await _connect_to_session(api, room_id, session)
 
 
 async def handle_disconnect(api: WebexAPI, room_id: str) -> None:
@@ -335,17 +377,68 @@ async def handle_disconnect(api: WebexAPI, room_id: str) -> None:
 
 async def handle_status(api: WebexAPI, room_id: str) -> None:
     state = get_state(room_id)
+    mode_label = "skip-permissions" if state.skip_permissions else "safe"
+    mode_desc = "Auto-approve tools" if state.skip_permissions else "Ask before tools"
+
     if state.session_id is None:
-        connected = "Not connected"
+        card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.2",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": "Status",
+                    "size": "Medium",
+                    "weight": "Bolder",
+                },
+                {
+                    "type": "FactSet",
+                    "facts": [
+                        {"title": "Session", "value": "Not connected"},
+                        {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
+                    ],
+                },
+                {
+                    "type": "TextBlock",
+                    "text": "Use /sessions to browse and connect.",
+                    "isSubtle": True,
+                    "spacing": "Medium",
+                },
+            ],
+        }
+        fallback = f"**Status:** Not connected\n**Mode:** {mode_label}\n\nUse `/sessions` to browse and connect."
     else:
-        connected = (
-            f"**Connected to:** {state.session_label}\n"
-            f"**Session ID:** {state.session_id}\n"
-            f"**Working dir:** {state.session_cwd}"
+        path = _short_path(state.session_cwd)
+        card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.2",
+            "body": [
+                {
+                    "type": "TextBlock",
+                    "text": "Status",
+                    "size": "Medium",
+                    "weight": "Bolder",
+                },
+                {
+                    "type": "FactSet",
+                    "facts": [
+                        {"title": "Session", "value": state.session_label},
+                        {"title": "Directory", "value": path},
+                        {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
+                    ],
+                },
+            ],
+        }
+        fallback = (
+            f"**Status:** Connected\n"
+            f"**Session:** {state.session_label}\n"
+            f"**Directory:** {path}\n"
+            f"**Mode:** {mode_label}"
         )
 
-    mode = "skip-permissions" if state.skip_permissions else "safe"
-    await api.send_message(room_id, f"{connected}\n**Mode:** {mode}")
+    await api.send_card_message(room_id, card, fallback)
 
 
 async def handle_safe(api: WebexAPI, room_id: str) -> None:
@@ -408,7 +501,7 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
             await api.send_message(room_id, chunk)
     except Exception:
         logger.exception("Error processing message")
-        error_text = "An error occurred while processing your message. Check the bot logs for details."
+        error_text = "Something went wrong while talking to Claude. Try sending your message again. If the problem persists, restart the bot."
         if thinking_id:
             await api.edit_message(thinking_id, room_id, error_text)
         else:
@@ -477,11 +570,12 @@ async def poll_loop(api: WebexAPI) -> None:
 
                 newest_id = messages[0]["id"]
 
-                # First time seeing this room: mark position, skip processing
+                # First time seeing this room: mark position and send welcome
                 if room_id not in initialized_rooms:
                     initialized_rooms.add(room_id)
                     last_seen[room_id] = newest_id
                     logger.info("Initialized room %s (last_seen=%s)", room_id[:12], newest_id[:12])
+                    await handle_start(api, room_id)
                     continue
 
                 # No new messages
