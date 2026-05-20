@@ -19,6 +19,18 @@ That's it. The script checks prerequisites, creates a virtual environment, insta
 
 > **macOS note:** You can also double-click `Run.command`, but macOS Gatekeeper may block it. If that happens, just use `python3 run.py` from Terminal instead.
 
+### Run in Background (survives terminal close)
+
+```bash
+nohup python3 run.py > bot.log 2>&1 &
+```
+
+This keeps the bot running even after you close the terminal. To stop it later:
+
+```bash
+kill $(pgrep -f "python3 run.py")
+```
+
 ### Alternative: Step-by-Step Setup
 
 If you prefer to set things up manually:
