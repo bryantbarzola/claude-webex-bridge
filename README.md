@@ -92,49 +92,123 @@ You should see `Bot authenticated as: ...` in the logs.
 
 | Command | Description |
 |---|---|
-| `/start` or `/help` | Welcome message with available commands |
+| `/help` | Show commands and current status |
 | `/new [dir]` | Start a new session (defaults to home directory) |
 | `/sessions` | List recent sessions as a numbered list |
 | `/resume N` | Resume session N from the list |
 | `/resume` | Quick-resume the most recent session |
 | `/disconnect` | Disconnect from current session |
 | `/status` | Show connection status and permission mode |
-| `/safe` | Toggle permission mode (skip-permissions / safe) |
+| `/yolo` | Auto-approve all tool use (default) |
+| `/safe` | Ask before each tool use (via Webex) |
+| `/strict` | Read-only tools only |
 | `/cancel` | Cancel a running command |
 
-Connect to a session, then send plain text messages to interact with Claude Code.
+Just type a message to start chatting — no need to `/resume` first. The bot auto-creates a session.
+
+## Permission Modes
+
+| Mode | Behavior |
+|---|---|
+| **yolo** (default) | Claude executes all tools without asking. Best for trusted environments. |
+| **safe** | Claude asks permission before each tool via Webex message. You reply yes/no. |
+| **strict** | Only read-only tools (Read, Glob, Grep) are allowed. Everything else is auto-denied. |
+
+Switch modes anytime with `/yolo`, `/safe`, or `/strict`.
+
+## Customizing Claude's Behavior
+
+The bot launches Claude Code sessions on the host machine. To customize how Claude behaves in those sessions, edit `~/.claude/CLAUDE.md` on the machine running the bot. This is Claude Code's standard system prompt — anything you put there shapes all sessions.
+
+Example `~/.claude/CLAUDE.md`:
+
+```markdown
+# My Assistant
+
+You are a helpful assistant for managing my lab environment.
+
+## Behavior
+- Keep responses concise — I'm reading on mobile
+- Propose before executing destructive actions
+- If something fails, report the exact error
+```
+
+This file is **not** included in the repo — it's personal to each deployment.
 
 ## Architecture
 
 ```
 bot.py          # Polling loop + command dispatch + message relay
+claude_cli.py   # Spawn-per-message CLI wrapper with stream-json event parsing
 webex_api.py    # Async httpx wrapper for Webex REST API
 auth.py         # Email-based authorization check
 config.py       # Environment variables + constants
 sessions.py     # Claude Code session discovery (reads ~/.claude/history.jsonl)
-claude_cli.py   # Async wrapper around the `claude` CLI
 ```
+
+### How It Works
+
+Each message spawns a `claude` CLI process with `--output-format stream-json`. The bot reads events (tool use, text output) line-by-line while the process runs, updating the "Thinking..." message with what Claude is doing. When the process exits, the final response replaces the thinking message.
+
+This gives you:
+- **Event visibility** — see which tools Claude is using mid-turn
+- **Resilience** — each message is independent; a crash doesn't cascade
+- **Session context** — Claude Code maintains conversation history via `--resume`
+- **Cancellation** — `/cancel` kills the process cleanly
 
 ### Why Polling
 
-- Polling keeps the minimum Python version at 3.9 (`webex-bot` websocket library requires 3.10+)
 - No public URL needed (webhooks require ngrok or similar — unnecessary for a personal bot)
 - ~2.5s latency is negligible when CLI calls take seconds-to-minutes
+- Works behind firewalls and NAT
 
 ### Key Design Decisions
 
-- **Session discovery** reads Claude Code's own history and project files — no separate database needed.
-- **Numbered session list** + `/resume N` replaces Telegram's inline keyboard buttons (Webex doesn't have an equivalent).
-- **Byte-aware message splitting** respects Webex's 7,439-byte message limit by splitting on UTF-8 byte length, not character count.
-- **"Thinking..." pattern** sends a placeholder message, then edits it with the first response chunk (falls back to a new message if the edit fails).
-- **Concurrency guard** prevents overlapping CLI calls — a second message while one is processing gets a "still processing" reply.
-- **Rate-limit handling** retries on 429 responses using the `Retry-After` header, up to 3 times.
-- **Permission modes**: `safe` (default) respects approval prompts. `skip-permissions` mode auto-approves tool use. Toggle with `/safe`. Note: in safe mode, `--print` cannot show interactive prompts, so the CLI may hang on approval requests — use `/safe` to switch to skip-permissions if this happens.
-- **CLI timeout** kills the process after 5 minutes to prevent runaway sessions.
+- **Session discovery** reads Claude Code's own history and project files — no separate database.
+- **Auto-connect** — just type to chat; bot creates a session automatically.
+- **Byte-aware message splitting** respects Webex's 7,439-byte limit by splitting on UTF-8 byte length.
+- **"Thinking..." pattern** sends a placeholder, then edits it with the response (falls back to new message if edit fails).
+- **Concurrency guard** prevents overlapping CLI calls — a second message while processing gets a "still processing" reply.
+- **Rate-limit handling** retries on 429 with `Retry-After` header, up to 3 times.
+- **CLI timeout** kills the process after 5 minutes.
 
-### Shared Modules
+## Deployment (systemd)
 
-`sessions.py` and `claude_cli.py` are designed to be reusable across different chat platform bridges. They import constants from `config.py`, which each project defines independently.
+For always-on deployment on a Linux server:
+
+```bash
+# Create systemd user service
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/claude-webex-bridge.service << 'EOF'
+[Unit]
+Description=Claude Webex Bridge Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/path/to/claude-webex-bridge
+ExecStart=/path/to/claude-webex-bridge/venv/bin/python3 bot.py
+Restart=on-failure
+RestartSec=10
+EnvironmentFile=/path/to/claude-webex-bridge/.env
+
+[Install]
+WantedBy=default.target
+EOF
+
+# Enable and start
+loginctl enable-linger $USER
+systemctl --user daemon-reload
+systemctl --user enable --now claude-webex-bridge
+
+# Management
+systemctl --user status claude-webex-bridge
+systemctl --user restart claude-webex-bridge
+journalctl --user -u claude-webex-bridge -f
+```
+
+The shell scripts (`start.sh`, `stop.sh`, etc.) auto-detect systemd and use it when available.
 
 ## Security
 

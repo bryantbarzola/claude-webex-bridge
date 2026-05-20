@@ -7,7 +7,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from auth import is_authorized
-from claude_cli import generate_session_id, send_message as cli_send_message, start_new_session as cli_start_new_session
+from claude_cli import (
+    PermissionMode,
+    StreamEvent,
+    ToolUseEvent,
+    generate_session_id,
+    send_message as cli_send_message,
+)
 from config import POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
 from sessions import SessionInfo, get_session_by_id, list_recent_sessions
 from webex_api import WebexAPI
@@ -18,9 +24,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress httpx INFO logs (too verbose during polling)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 @dataclass
 class BotState:
@@ -28,29 +37,28 @@ class BotState:
     session_cwd: str | None = None
     session_label: str = ""
     session_is_new: bool = False
-    skip_permissions: bool = False
+    mode: str = PermissionMode.YOLO
     pending_sessions: list[SessionInfo] = field(default_factory=list)
     processing: bool = False
     _active_process: asyncio.subprocess.Process | None = field(default=None, repr=False)
     _thinking_id: str | None = field(default=None, repr=False)
+    _last_tool: str = field(default="", repr=False)
 
 
 _room_states: dict[str, BotState] = {}
 
 
 def get_state(room_id: str) -> BotState:
-    """Get or create per-room bot state."""
     if room_id not in _room_states:
         _room_states[room_id] = BotState()
     return _room_states[room_id]
 
 
 # ---------------------------------------------------------------------------
-# Message splitting (byte-aware for Webex)
+# Message splitting
 # ---------------------------------------------------------------------------
 
 def split_message(text: str, max_bytes: int = WEBEX_MAX_MESSAGE_BYTES) -> list[str]:
-    """Split text into chunks that each fit within max_bytes when UTF-8 encoded."""
     if len(text.encode("utf-8")) <= max_bytes:
         return [text]
 
@@ -63,9 +71,7 @@ def split_message(text: str, max_bytes: int = WEBEX_MAX_MESSAGE_BYTES) -> list[s
             if current:
                 chunks.append(current)
                 current = ""
-            # Check if the single line itself exceeds the limit
             if len(line.encode("utf-8")) > max_bytes:
-                # Hard-split the line without breaking multi-byte characters
                 chunks.extend(_hard_split_line(line, max_bytes))
             else:
                 current = line
@@ -78,7 +84,6 @@ def split_message(text: str, max_bytes: int = WEBEX_MAX_MESSAGE_BYTES) -> list[s
 
 
 def _hard_split_line(line: str, max_bytes: int) -> list[str]:
-    """Split a single long line by byte length without breaking UTF-8 characters."""
     parts: list[str] = []
     current = ""
     for char in line:
@@ -98,12 +103,10 @@ def _hard_split_line(line: str, max_bytes: int) -> list[str]:
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Session displays that aren't useful to show
-_SKIP_DISPLAYS = {"/exit", "/help", "/start", "/resume", "/sessions", ""}
+_SKIP_DISPLAYS = {"/exit", "/help", "/resume", "/sessions", ""}
 
 
 def _relative_time(epoch_ms: int) -> str:
-    """Convert an epoch-millisecond timestamp to a human-readable relative time."""
     now = time.time() * 1000
     diff_seconds = (now - epoch_ms) / 1000
     if diff_seconds < 0:
@@ -123,7 +126,6 @@ def _relative_time(epoch_ms: int) -> str:
 
 
 def _short_path(cwd: str) -> str:
-    """Shorten a working directory path for display."""
     try:
         home = str(Path.home())
         if cwd.startswith(home):
@@ -133,29 +135,43 @@ def _short_path(cwd: str) -> str:
             return f"~/{relative}" if relative else "~"
     except Exception:
         pass
-    # Fallback: show last 2 directory components
     parts = Path(cwd).parts
     if len(parts) > 2:
         return f".../{'/'.join(parts[-2:])}"
     return cwd
 
 
+def _format_elapsed(seconds: float) -> str:
+    s = int(seconds)
+    if s < 60:
+        return f"{s}s"
+    m = s // 60
+    remaining = s % 60
+    if remaining == 0:
+        return f"{m}m"
+    return f"{m}m {remaining}s"
+
+
+def _mode_label(mode: str) -> str:
+    if mode == PermissionMode.YOLO:
+        return "yolo (auto-approve all)"
+    elif mode == PermissionMode.SAFE:
+        return "safe (asks before tools)"
+    elif mode == PermissionMode.STRICT:
+        return "strict (read-only tools)"
+    return mode
+
+
 # ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
-def _build_welcome_card() -> tuple[dict, str]:
-    """Build the welcome Adaptive Card and fallback text."""
-    commands = [
-        ("/new [dir]", "Start a new session"),
-        ("/sessions", "List recent sessions"),
-        ("/resume N", "Resume session N from the list"),
-        ("/resume", "Quick-resume latest session"),
-        ("/disconnect", "Disconnect from session"),
-        ("/status", "Show connection info"),
-        ("/safe", "Toggle permission mode"),
-        ("/cancel", "Cancel a running command"),
-    ]
+def _build_help_card(state: BotState | None = None) -> tuple[dict, str]:
+    if state and state.session_id:
+        path = _short_path(state.session_cwd) if state.session_cwd else "~"
+        status_text = f"● Active · {path} · {state.mode}"
+    else:
+        status_text = "○ No active session"
 
     card = {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
@@ -163,53 +179,61 @@ def _build_welcome_card() -> tuple[dict, str]:
         "version": "1.2",
         "body": [
             {
-                "type": "TextBlock",
-                "text": "Claude Code Bridge",
-                "size": "Medium",
-                "weight": "Bolder",
-            },
-            {
-                "type": "FactSet",
-                "facts": [
-                    {"title": cmd, "value": desc}
-                    for cmd, desc in commands
-                ],
-            },
-            {
                 "type": "Container",
-                "separator": True,
                 "style": "accent",
                 "items": [
                     {
                         "type": "TextBlock",
-                        "text": "Tip: Use `/resume` to jump straight into your latest session.",
-                        "wrap": True,
-                        "weight": "Bolder",
-                    }
+                        "text": "Claude Code Bridge",
+                        "size": "large",
+                        "weight": "bolder",
+                    },
+                    {
+                        "type": "TextBlock",
+                        "text": status_text,
+                        "size": "small",
+                        "spacing": "small",
+                    },
+                ],
+            },
+            {
+                "type": "TextBlock",
+                "text": "Just type a message to chat. Commands:",
+                "wrap": True,
+                "spacing": "medium",
+                "size": "small",
+            },
+            {
+                "type": "FactSet",
+                "facts": [
+                    {"title": "/new [dir]", "value": "Start a fresh session"},
+                    {"title": "/sessions", "value": "List recent sessions"},
+                    {"title": "/resume N", "value": "Resume session N"},
+                    {"title": "/status", "value": "Current session info"},
+                    {"title": "/cancel", "value": "Cancel running task"},
+                    {"title": "/disconnect", "value": "Disconnect from session"},
+                    {"title": "/yolo", "value": "Auto-approve all tools"},
+                    {"title": "/safe", "value": "Ask before tool use"},
+                    {"title": "/strict", "value": "Read-only tools only"},
                 ],
             },
         ],
     }
 
     fallback = (
-        "**Claude Code Bridge**\n\n"
-        + "\n".join(f"- `{cmd}` -- {desc}" for cmd, desc in commands)
-        + "\n\nTip: Use `/resume` to jump straight into your latest session."
+        f"Claude Code Bridge — {status_text}\n\n"
+        "Commands: /new, /sessions, /resume N, /status, /cancel, /disconnect, /yolo, /safe, /strict"
     )
-
     return card, fallback
 
 
-async def handle_start(api: WebexAPI, room_id: str) -> None:
-    card, fallback = _build_welcome_card()
+async def handle_help(api: WebexAPI, room_id: str) -> None:
+    state = get_state(room_id)
+    card, fallback = _build_help_card(state)
     await api.send_card_message(room_id, card, fallback)
-
-    # Auto-send sessions list so user can immediately /resume
-    await handle_sessions(api, room_id)
 
 
 def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
-    """Build an Adaptive Card JSON for the session list."""
     body: list[dict] = [
         {
             "type": "TextBlock",
@@ -222,27 +246,8 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
     for i, s in enumerate(sessions, 1):
         display = s.display if s.display else s.session_id[:12]
         ago = _relative_time(s.timestamp)
-
-        # Truncate display text to keep rows compact
         if len(display) > 60:
             display = display[:57] + "..."
-
-        # Right column: conversation snippet (primary), session ID · time (secondary)
-        right_items: list[dict] = [
-            {
-                "type": "TextBlock",
-                "text": display,
-                "weight": "Bolder",
-                "wrap": True,
-            },
-            {
-                "type": "TextBlock",
-                "text": f"{s.session_id} \u00b7 {ago}",
-                "size": "Small",
-                "isSubtle": True,
-                "spacing": "None",
-            },
-        ]
 
         body.append(
             {
@@ -268,7 +273,21 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
                             {
                                 "type": "Column",
                                 "width": "stretch",
-                                "items": right_items,
+                                "items": [
+                                    {
+                                        "type": "TextBlock",
+                                        "text": display,
+                                        "weight": "Bolder",
+                                        "wrap": True,
+                                    },
+                                    {
+                                        "type": "TextBlock",
+                                        "text": f"{s.session_id[:8]}... · {ago}",
+                                        "size": "Small",
+                                        "isSubtle": True,
+                                        "spacing": "None",
+                                    },
+                                ],
                             },
                         ],
                     }
@@ -302,24 +321,17 @@ def _build_sessions_card(sessions: list[SessionInfo]) -> dict:
 
 async def handle_sessions(api: WebexAPI, room_id: str) -> None:
     state = get_state(room_id)
-    # Fetch extra sessions to account for filtered ones (run in thread to avoid blocking event loop)
     all_sessions = await asyncio.to_thread(list_recent_sessions, 20)
     if not all_sessions:
-        await api.send_message(room_id, "No recent sessions found. Make sure you've used Claude Code at least once.")
+        await api.send_message(room_id, "No recent sessions found.")
         return
 
-    # Filter out sessions with useless display names
     filtered = [s for s in all_sessions if s.display.strip().lower() not in _SKIP_DISPLAYS]
-
-    # Fall back to unfiltered if everything got filtered
     if not filtered:
         filtered = all_sessions
-
-    # Limit to 5 for display
     filtered = filtered[:5]
     state.pending_sessions = filtered
 
-    # Build fallback text for clients without card support
     lines = ["**Recent Sessions**\n"]
     for i, s in enumerate(filtered, 1):
         display = s.display if s.display else s.session_id[:12]
@@ -327,8 +339,8 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
             display = display[:57] + "..."
         ago = _relative_time(s.timestamp)
         lines.append(f"**{i}.** {display}")
-        lines.append(f"   {s.session_id} \u00b7 {ago}\n")
-    lines.append("Reply `/resume N` to connect (e.g. `/resume 1`)")
+        lines.append(f"   {s.session_id[:8]}... · {ago}\n")
+    lines.append("Reply `/resume N` to connect")
     fallback_text = "\n".join(lines)
 
     card = _build_sessions_card(filtered)
@@ -336,15 +348,12 @@ async def handle_sessions(api: WebexAPI, room_id: str) -> None:
 
 
 async def _connect_to_session(api: WebexAPI, room_id: str, session: SessionInfo) -> None:
-    """Set state and send confirmation card for a connected session."""
     state = get_state(room_id)
     state.session_id = session.session_id
     state.session_cwd = session.cwd
     state.session_label = session.display or session.session_id[:12]
     state.session_is_new = False
 
-    mode_label = "skip-permissions" if state.skip_permissions else "safe"
-    mode_desc = "Auto-approve tools" if state.skip_permissions else "Ask before tools"
     path = _short_path(session.cwd)
 
     card = {
@@ -354,7 +363,7 @@ async def _connect_to_session(api: WebexAPI, room_id: str, session: SessionInfo)
         "body": [
             {
                 "type": "TextBlock",
-                "text": "\u2705 Connected",
+                "text": "Connected",
                 "size": "Medium",
                 "weight": "Bolder",
             },
@@ -363,31 +372,24 @@ async def _connect_to_session(api: WebexAPI, room_id: str, session: SessionInfo)
                 "facts": [
                     {"title": "Session", "value": state.session_label},
                     {"title": "Directory", "value": path},
-                    {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
+                    {"title": "Mode", "value": _mode_label(state.mode)},
                 ],
             },
             {
                 "type": "TextBlock",
-                "text": "Send a message to interact with this session.",
+                "text": "Send a message to continue.",
                 "isSubtle": True,
                 "spacing": "Medium",
             },
         ],
     }
-    fallback = (
-        f"**Connected to:** {state.session_label}\n"
-        f"**Directory:** {path}\n"
-        f"**Mode:** {mode_label}\n\n"
-        "Send a message to interact with this session."
-    )
+    fallback = f"Connected to: {state.session_label}\nDirectory: {path}\nMode: {_mode_label(state.mode)}"
     await api.send_card_message(room_id, card, fallback)
 
 
 async def handle_new_session(api: WebexAPI, room_id: str, arg: str) -> None:
-    """Start a brand new Claude Code session."""
     state = get_state(room_id)
 
-    # Determine working directory
     if arg:
         target = Path(arg).expanduser().resolve()
         if not target.is_dir():
@@ -397,19 +399,12 @@ async def handle_new_session(api: WebexAPI, room_id: str, arg: str) -> None:
     else:
         cwd = str(Path.home())
 
-    # Generate a new session ID
-    new_id = generate_session_id()
-
-    # Update state
-    state.session_id = new_id
+    state.session_id = generate_session_id()
     state.session_cwd = cwd
     state.session_label = "New session"
     state.session_is_new = True
 
-    mode_label = "skip-permissions" if state.skip_permissions else "safe"
-    mode_desc = "Auto-approve tools" if state.skip_permissions else "Ask before tools"
     path = _short_path(cwd)
-
     card = {
         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
         "type": "AdaptiveCard",
@@ -417,7 +412,7 @@ async def handle_new_session(api: WebexAPI, room_id: str, arg: str) -> None:
         "body": [
             {
                 "type": "TextBlock",
-                "text": "\u2728 New Session",
+                "text": "New Session",
                 "size": "Medium",
                 "weight": "Bolder",
             },
@@ -425,7 +420,7 @@ async def handle_new_session(api: WebexAPI, room_id: str, arg: str) -> None:
                 "type": "FactSet",
                 "facts": [
                     {"title": "Directory", "value": path},
-                    {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
+                    {"title": "Mode", "value": _mode_label(state.mode)},
                 ],
             },
             {
@@ -436,26 +431,19 @@ async def handle_new_session(api: WebexAPI, room_id: str, arg: str) -> None:
             },
         ],
     }
-    fallback = (
-        f"**New Session**\n"
-        f"**Directory:** {path}\n"
-        f"**Mode:** {mode_label}\n\n"
-        "Send your first message to begin."
-    )
+    fallback = f"New Session\nDirectory: {path}\nMode: {_mode_label(state.mode)}"
     await api.send_card_message(room_id, card, fallback)
 
 
-async def handle_connect(api: WebexAPI, room_id: str, arg: str) -> None:
+async def handle_resume(api: WebexAPI, room_id: str, arg: str) -> None:
     state = get_state(room_id)
 
-    # No argument: connect to the most recent session
     if not arg:
         all_sessions = await asyncio.to_thread(list_recent_sessions, 5)
         if not all_sessions:
-            await api.send_message(room_id, "No recent sessions found. Use Claude Code first, then try again.")
+            await api.send_message(room_id, "No recent sessions found.")
             return
-        session = all_sessions[0]
-        await _connect_to_session(api, room_id, session)
+        await _connect_to_session(api, room_id, all_sessions[0])
         return
 
     try:
@@ -465,22 +453,17 @@ async def handle_connect(api: WebexAPI, room_id: str, arg: str) -> None:
         return
 
     if not state.pending_sessions:
-        await api.send_message(room_id, "No session list cached. Run `/sessions` first.")
+        await api.send_message(room_id, "Run `/sessions` first.")
         return
 
     if index < 1 or index > len(state.pending_sessions):
-        await api.send_message(
-            room_id,
-            f"Out of range. Pick a number between 1 and {len(state.pending_sessions)}.",
-        )
+        await api.send_message(room_id, f"Pick between 1 and {len(state.pending_sessions)}.")
         return
 
     selected = state.pending_sessions[index - 1]
-
-    # Re-verify the session still exists on disk (run in thread to avoid blocking event loop)
     session = await asyncio.to_thread(get_session_by_id, selected.session_id)
     if session is None:
-        await api.send_message(room_id, "Session not found. It may have been deleted. Run `/sessions` again.")
+        await api.send_message(room_id, "Session not found. Run `/sessions` again.")
         return
 
     await _connect_to_session(api, room_id, session)
@@ -497,120 +480,45 @@ async def handle_disconnect(api: WebexAPI, room_id: str) -> None:
     state.session_cwd = None
     state.session_label = ""
     state.session_is_new = False
-    await api.send_message(room_id, f"Disconnected from: {label}\n\nUse `/sessions` to connect to another session.")
+    await api.send_message(room_id, f"Disconnected from: {label}")
 
 
 async def handle_status(api: WebexAPI, room_id: str) -> None:
     state = get_state(room_id)
-    mode_label = "skip-permissions" if state.skip_permissions else "safe"
-    mode_desc = "Auto-approve tools" if state.skip_permissions else "Ask before tools"
 
     if state.session_id is None:
-        card = {
-            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-            "type": "AdaptiveCard",
-            "version": "1.2",
-            "body": [
-                {
-                    "type": "TextBlock",
-                    "text": "Status",
-                    "size": "Medium",
-                    "weight": "Bolder",
-                },
-                {
-                    "type": "FactSet",
-                    "facts": [
-                        {"title": "Session", "value": "Not connected"},
-                        {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
-                    ],
-                },
-                {
-                    "type": "TextBlock",
-                    "text": "Use /sessions to browse and connect.",
-                    "isSubtle": True,
-                    "spacing": "Medium",
-                },
-            ],
-        }
-        fallback = f"**Status:** Not connected\n**Mode:** {mode_label}\n\nUse `/sessions` to browse and connect."
+        facts = [
+            {"title": "Session", "value": "Not connected"},
+            {"title": "Mode", "value": _mode_label(state.mode)},
+        ]
     else:
         path = _short_path(state.session_cwd)
-        card = {
-            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-            "type": "AdaptiveCard",
-            "version": "1.2",
-            "body": [
-                {
-                    "type": "TextBlock",
-                    "text": "Status",
-                    "size": "Medium",
-                    "weight": "Bolder",
-                },
-                {
-                    "type": "FactSet",
-                    "facts": [
-                        {"title": "Session", "value": state.session_label},
-                        {"title": "Directory", "value": path},
-                        {"title": "Mode", "value": f"{mode_label} ({mode_desc})"},
-                    ],
-                },
-            ],
-        }
-        fallback = (
-            f"**Status:** Connected\n"
-            f"**Session:** {state.session_label}\n"
-            f"**Directory:** {path}\n"
-            f"**Mode:** {mode_label}"
-        )
+        facts = [
+            {"title": "Session", "value": state.session_label},
+            {"title": "Directory", "value": path},
+            {"title": "Mode", "value": _mode_label(state.mode)},
+        ]
 
+    card = {
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        "type": "AdaptiveCard",
+        "version": "1.2",
+        "body": [
+            {"type": "TextBlock", "text": "Status", "size": "Medium", "weight": "Bolder"},
+            {"type": "FactSet", "facts": facts},
+        ],
+    }
+    fallback = "\n".join(f"{f['title']}: {f['value']}" for f in facts)
     await api.send_card_message(room_id, card, fallback)
 
 
-async def handle_safe(api: WebexAPI, room_id: str) -> None:
+async def handle_mode(api: WebexAPI, room_id: str, mode: str) -> None:
     state = get_state(room_id)
-    state.skip_permissions = not state.skip_permissions
-
-    if state.skip_permissions:
-        await api.send_message(
-            room_id,
-            "**Mode: skip-permissions**\n"
-            "Claude will execute tools without asking for approval.",
-        )
-    else:
-        await api.send_message(
-            room_id,
-            "**Mode: safe**\n\n"
-            "> **Note:** Safe mode may cause commands to hang because approval prompts "
-            "can't be shown. Use `/safe` to switch back if this happens.",
-        )
-
-
-def _format_elapsed(seconds: float) -> str:
-    """Format elapsed seconds as a compact string like '15s', '1m 30s', '5m'."""
-    s = int(seconds)
-    if s < 60:
-        return f"{s}s"
-    m = s // 60
-    remaining = s % 60
-    if remaining == 0:
-        return f"{m}m"
-    return f"{m}m {remaining}s"
-
-
-async def _update_thinking(api: WebexAPI, msg_id: str, room_id: str) -> None:
-    """Periodically update the 'Thinking...' message with elapsed time."""
-    start = time.monotonic()
-    try:
-        while True:
-            await asyncio.sleep(15)
-            elapsed = _format_elapsed(time.monotonic() - start)
-            await api.edit_message(msg_id, room_id, f"Thinking... ({elapsed})")
-    except asyncio.CancelledError:
-        pass
+    state.mode = mode
+    await api.send_message(room_id, f"Mode: **{_mode_label(mode)}**")
 
 
 async def handle_cancel(api: WebexAPI, room_id: str) -> None:
-    """Cancel the currently running CLI process."""
     state = get_state(room_id)
     if not state.processing:
         await api.send_message(room_id, "Nothing to cancel.")
@@ -622,69 +530,89 @@ async def handle_cancel(api: WebexAPI, room_id: str) -> None:
             process.kill()
             await process.wait()
         except ProcessLookupError:
-            pass  # Already exited
+            pass
 
-    # Edit thinking message to show cancellation
     if state._thinking_id:
         await api.edit_message(state._thinking_id, room_id, "Cancelled.")
 
     state._active_process = None
     state._thinking_id = None
     state.processing = False
-    logger.info("Command cancelled by user in room %s", room_id[:12])
+    logger.info("Cancelled in room %s", room_id[:12])
 
+
+# ---------------------------------------------------------------------------
+# Thinking indicator with tool visibility
+# ---------------------------------------------------------------------------
+
+async def _update_thinking(api: WebexAPI, state: BotState, room_id: str, tool_event: asyncio.Event) -> None:
+    start = time.monotonic()
+    try:
+        while True:
+            # Wait for either a tool event or 15s timeout (for elapsed time updates)
+            try:
+                await asyncio.wait_for(tool_event.wait(), timeout=15)
+                tool_event.clear()
+            except asyncio.TimeoutError:
+                pass
+
+            elapsed = _format_elapsed(time.monotonic() - start)
+            tool_info = f" · {state._last_tool}" if state._last_tool else ""
+            await api.edit_message(state._thinking_id, room_id, f"Thinking... ({elapsed}{tool_info})")
+    except asyncio.CancelledError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Text message handler (core loop)
+# ---------------------------------------------------------------------------
 
 async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
-    """Forward a plain text message to the connected Claude session."""
     state = get_state(room_id)
-    if state.session_id is None:
-        await api.send_message(room_id, "Not connected to any session. Use `/sessions` to browse and connect.")
-        return
 
-    # Safe without a lock because the poll loop dispatches messages sequentially (await).
+    if state.session_id is None:
+        state.session_id = generate_session_id()
+        state.session_is_new = True
+        state.session_cwd = str(Path.home())
+
     if state.processing:
-        await api.send_message(room_id, "**Still processing** the previous message. Please wait, or use `/cancel` to abort.")
+        await api.send_message(room_id, "Still processing. Use `/cancel` to abort.")
         return
 
     state.processing = True
+    state._last_tool = ""
     thinking_id = None
     updater_task = None
+    tool_event = asyncio.Event()
+
     try:
-        # Send "Thinking..." placeholder
         thinking = await api.send_message(room_id, "Thinking...")
         thinking_id = thinking.get("id")
         state._thinking_id = thinking_id
 
-        # Start progress updater
         if thinking_id:
-            updater_task = asyncio.create_task(
-                _update_thinking(api, thinking_id, room_id)
-            )
+            updater_task = asyncio.create_task(_update_thinking(api, state, room_id, tool_event))
 
-        was_new = state.session_is_new
-        if was_new:
-            response = await cli_start_new_session(
-                session_id=state.session_id,
-                message=text,
-                cwd=state.session_cwd,
-                skip_permissions=state.skip_permissions,
-                on_process_started=lambda p: setattr(state, '_active_process', p),
-            )
-            # Only flip the flag if the CLI didn't return an error
-            if not response.startswith("Error:"):
-                state.session_is_new = False
-        else:
-            response = await cli_send_message(
-                session_id=state.session_id,
-                message=text,
-                cwd=state.session_cwd,
-                skip_permissions=state.skip_permissions,
-                on_process_started=lambda p: setattr(state, '_active_process', p),
-            )
+        def on_event(event: StreamEvent) -> None:
+            if isinstance(event, ToolUseEvent):
+                state._last_tool = event.tool_name
+                tool_event.set()
+
+        response = await cli_send_message(
+            session_id=state.session_id,
+            message=text,
+            cwd=state.session_cwd,
+            is_new=state.session_is_new,
+            mode=state.mode,
+            on_event=on_event,
+            on_process_started=lambda p: setattr(state, '_active_process', p),
+        )
+
+        if state.session_is_new and not response.startswith("Error:"):
+            state.session_is_new = False
 
         chunks = split_message(response)
 
-        # Edit "Thinking..." with first chunk, fallback to new message
         if thinking_id:
             result = await api.edit_message(thinking_id, room_id, chunks[0])
             if result is None:
@@ -692,12 +620,14 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
         else:
             await api.send_message(room_id, chunks[0])
 
-        # Send remaining chunks as new messages
         for chunk in chunks[1:]:
             await api.send_message(room_id, chunk)
+
+    except asyncio.CancelledError:
+        pass
     except Exception:
         logger.exception("Error processing message")
-        error_text = "Something went wrong while talking to Claude. Try sending your message again. If the problem persists, restart the bot."
+        error_text = "Something went wrong. Try again, or `/cancel` then retry."
         if thinking_id:
             await api.edit_message(thinking_id, room_id, error_text)
         else:
@@ -707,6 +637,7 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
             updater_task.cancel()
         state._active_process = None
         state._thinking_id = None
+        state._last_tool = ""
         state.processing = False
 
 
@@ -715,18 +646,21 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 COMMANDS = {
-    "/start": handle_start,
-    "/help": handle_start,
+    "/help": handle_help,
     "/sessions": handle_sessions,
     "/disconnect": handle_disconnect,
     "/status": handle_status,
-    "/safe": handle_safe,
     "/cancel": handle_cancel,
+}
+
+MODE_COMMANDS = {
+    "/yolo": PermissionMode.YOLO,
+    "/safe": PermissionMode.SAFE,
+    "/strict": PermissionMode.STRICT,
 }
 
 
 async def dispatch(api: WebexAPI, room_id: str, text: str) -> None:
-    """Route an incoming message to the appropriate handler."""
     stripped = text.strip()
 
     if not stripped.startswith("/"):
@@ -738,13 +672,15 @@ async def dispatch(api: WebexAPI, room_id: str, text: str) -> None:
     arg = parts[1] if len(parts) > 1 else ""
 
     if command == "/resume":
-        await handle_connect(api, room_id, arg.strip())
+        await handle_resume(api, room_id, arg.strip())
     elif command == "/new":
         await handle_new_session(api, room_id, arg.strip())
+    elif command in MODE_COMMANDS:
+        await handle_mode(api, room_id, MODE_COMMANDS[command])
     elif command in COMMANDS:
         await COMMANDS[command](api, room_id)
     else:
-        await api.send_message(room_id, f"Unknown command: `{command}`\nUse `/help` for available commands.")
+        await api.send_message(room_id, f"Unknown command: `{command}`\nType `/help` for commands.")
 
 
 # ---------------------------------------------------------------------------
@@ -752,32 +688,60 @@ async def dispatch(api: WebexAPI, room_id: str, text: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _send_startup_welcome(api: WebexAPI) -> str | None:
-    """Send welcome card to the authorized user on startup. Returns the room ID or None."""
     try:
-        card, fallback = _build_welcome_card()
+        card = {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.2",
+            "body": [
+                {
+                    "type": "Container",
+                    "style": "accent",
+                    "items": [
+                        {
+                            "type": "TextBlock",
+                            "text": "Claude Code Bridge",
+                            "size": "large",
+                            "weight": "bolder",
+                        },
+                        {
+                            "type": "TextBlock",
+                            "text": "Bot started",
+                            "size": "small",
+                            "spacing": "small",
+                        },
+                    ],
+                },
+                {
+                    "type": "TextBlock",
+                    "text": "Send a message to begin or type /help.",
+                    "wrap": True,
+                    "spacing": "medium",
+                    "size": "small",
+                },
+            ],
+        }
+        fallback = "Bot started. Send a message to begin or type /help."
         result = await api.send_card_to_email(WEBEX_USER_EMAIL, card, fallback)
         room_id = result.get("roomId")
         if room_id:
-            logger.info("Sent startup welcome to %s (room=%s)", WEBEX_USER_EMAIL, room_id[:12])
-            # Also send sessions list into the same room
-            await handle_sessions(api, room_id)
+            logger.info("Startup notice sent to %s (room=%s)", WEBEX_USER_EMAIL, room_id[:12])
         return room_id
     except Exception:
-        logger.exception("Failed to send startup welcome (will still poll normally)")
+        logger.exception("Failed to send startup welcome")
         return None
 
 
 async def poll_loop(api: WebexAPI) -> None:
-    """Poll Webex for new messages in direct rooms."""
-    # Track the newest seen message ID per room to avoid replaying history
     last_seen: dict[str, str] = {}
-    # Rooms we've initialized (first poll marks position, doesn't process)
     initialized_rooms: set[str] = set()
 
-    # Send welcome to the user proactively so they don't need to find the bot
     startup_room = await _send_startup_welcome(api)
     if startup_room:
         initialized_rooms.add(startup_room)
+        msgs = await api.list_messages(startup_room, max_messages=1)
+        if msgs:
+            last_seen[startup_room] = msgs[0]["id"]
 
     logger.info("Polling started (interval=%.1fs)", POLL_INTERVAL_SECONDS)
 
@@ -794,41 +758,30 @@ async def poll_loop(api: WebexAPI) -> None:
 
                 newest_id = messages[0]["id"]
 
-                # First time seeing this room: mark position and send welcome
                 if room_id not in initialized_rooms:
                     initialized_rooms.add(room_id)
                     last_seen[room_id] = newest_id
-                    logger.info("Initialized room %s (last_seen=%s)", room_id[:12], newest_id[:12])
-                    await handle_start(api, room_id)
+                    logger.info("Initialized room %s", room_id[:12])
                     continue
 
-                # No new messages
                 if last_seen.get(room_id) == newest_id:
                     continue
 
-                # Collect messages newer than last-seen
                 new_messages = []
                 for msg in messages:
                     if msg["id"] == last_seen.get(room_id):
                         break
                     new_messages.append(msg)
 
-                # Update position
                 last_seen[room_id] = newest_id
-
-                # Process in chronological order (API returns newest-first)
                 new_messages.reverse()
 
                 for msg in new_messages:
-                    # Skip bot's own messages
                     if msg.get("personId") == api.bot_id:
                         continue
-
-                    # Check authorization
                     sender_email = msg.get("personEmail", "")
                     if not is_authorized(sender_email):
                         continue
-
                     text = msg.get("text", "").strip()
                     if not text:
                         continue
