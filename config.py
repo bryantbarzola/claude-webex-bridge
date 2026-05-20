@@ -19,8 +19,11 @@ def _require_env(name: str) -> str:
 WEBEX_BOT_TOKEN: str = _require_env("WEBEX_BOT_TOKEN")
 WEBEX_USER_EMAIL: str = _require_env("WEBEX_USER_EMAIL")
 
+BOT_DISPLAY_NAME: str = os.environ.get("BOT_DISPLAY_NAME", "Claude Code Bridge").strip()
+BOT_TAGLINE: str = os.environ.get("BOT_TAGLINE", "").strip()
+
 WEBEX_BASE_URL: str = "https://webexapis.com/v1"
-WEBEX_MAX_MESSAGE_BYTES: int = 7000  # Webex limit is ~7439 bytes; 7000 for safety margin
+WEBEX_MAX_MESSAGE_BYTES: int = 7000
 POLL_INTERVAL_SECONDS: float = 2.5
 
 CLAUDE_HISTORY_FILE: Path = Path.home() / ".claude" / "history.jsonl"

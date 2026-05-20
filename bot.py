@@ -14,7 +14,7 @@ from claude_cli import (
     generate_session_id,
     send_message as cli_send_message,
 )
-from config import POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
+from config import BOT_DISPLAY_NAME, BOT_TAGLINE, POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
 from sessions import SessionInfo, get_session_by_id, list_recent_sessions
 from webex_api import WebexAPI
 
@@ -184,7 +184,7 @@ def _build_help_card(state: BotState | None = None) -> tuple[dict, str]:
                 "items": [
                     {
                         "type": "TextBlock",
-                        "text": "Claude Code Bridge",
+                        "text": BOT_DISPLAY_NAME,
                         "size": "large",
                         "weight": "bolder",
                     },
@@ -221,7 +221,7 @@ def _build_help_card(state: BotState | None = None) -> tuple[dict, str]:
     }
 
     fallback = (
-        f"Claude Code Bridge — {status_text}\n\n"
+        f"{BOT_DISPLAY_NAME} — {status_text}\n\n"
         "Commands: /new, /sessions, /resume N, /status, /cancel, /disconnect, /yolo, /safe, /strict"
     )
     return card, fallback
@@ -700,13 +700,13 @@ async def _send_startup_welcome(api: WebexAPI) -> str | None:
                     "items": [
                         {
                             "type": "TextBlock",
-                            "text": "Claude Code Bridge",
+                            "text": BOT_DISPLAY_NAME,
                             "size": "large",
                             "weight": "bolder",
                         },
                         {
                             "type": "TextBlock",
-                            "text": "Bot started",
+                            "text": BOT_TAGLINE or "Bot started",
                             "size": "small",
                             "spacing": "small",
                         },
@@ -721,7 +721,7 @@ async def _send_startup_welcome(api: WebexAPI) -> str | None:
                 },
             ],
         }
-        fallback = "Bot started. Send a message to begin or type /help."
+        fallback = f"{BOT_TAGLINE or 'Bot started'}. Send a message to begin or type /help."
         result = await api.send_card_to_email(WEBEX_USER_EMAIL, card, fallback)
         room_id = result.get("roomId")
         if room_id:
