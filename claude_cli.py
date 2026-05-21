@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from config import CLI_TIMEOUT_SECONDS
+from config import CLI_IDLE_TIMEOUT_SECONDS, CLI_TIMEOUT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +86,57 @@ class ResultEvent(StreamEvent):
 
 
 # ---------------------------------------------------------------------------
+# Activity-based timeout
+# ---------------------------------------------------------------------------
+
+class _IdleTimeoutError(Exception):
+    pass
+
+
+class _HardTimeoutError(Exception):
+    pass
+
+
+class _ActivityTracker:
+    def __init__(self) -> None:
+        self.last_activity: float = asyncio.get_event_loop().time()
+
+    def touch(self) -> None:
+        self.last_activity = asyncio.get_event_loop().time()
+
+
+async def _wait_with_activity_timeout(
+    stream_task: asyncio.Task[str],
+    activity: _ActivityTracker,
+) -> str:
+    """Wait for stream_task, enforcing idle timeout and hard cap."""
+    start = asyncio.get_event_loop().time()
+    check_interval = 5.0
+
+    while not stream_task.done():
+        await asyncio.sleep(check_interval)
+        now = asyncio.get_event_loop().time()
+
+        if now - start > CLI_TIMEOUT_SECONDS:
+            stream_task.cancel()
+            try:
+                await stream_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise _HardTimeoutError()
+
+        if now - activity.last_activity > CLI_IDLE_TIMEOUT_SECONDS:
+            stream_task.cancel()
+            try:
+                await stream_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            raise _IdleTimeoutError()
+
+    return stream_task.result()
+
+
+# ---------------------------------------------------------------------------
 # Core: send a message (spawn per turn, stream events)
 # ---------------------------------------------------------------------------
 
@@ -145,16 +196,8 @@ async def send_message(
     """
     Send a message to Claude Code. Spawns a process, streams events, returns final text.
 
-    Args:
-        session_id: Session UUID (--resume or --session-id)
-        message: User message text
-        cwd: Working directory for Claude
-        is_new: True for first message (uses --session-id), False for resume
-        mode: Permission mode (yolo/safe/strict)
-        on_event: Called for each stream event (tool_use, text) — for UI updates
-        on_permission: Called when Claude requests permission (safe mode only).
-                       Must return True (approve) or False (deny).
-        on_process_started: Called with the process object (for /cancel)
+    Uses activity-based timeout: process stays alive as long as events are being received,
+    killed only after CLI_IDLE_TIMEOUT_SECONDS of inactivity or CLI_TIMEOUT_SECONDS total.
     """
     try:
         cmd = _build_cmd(session_id, message, is_new, mode)
@@ -181,17 +224,28 @@ async def send_message(
         on_process_started(process)
 
     text_parts: list[str] = []
-    result_text = ""
+    activity = _ActivityTracker()
+
+    def wrapped_on_event(event: StreamEvent) -> Any:
+        activity.touch()
+        if on_event:
+            return on_event(event)
 
     try:
-        result_text = await asyncio.wait_for(
-            _stream_events(process, text_parts, on_event, on_permission),
-            timeout=CLI_TIMEOUT_SECONDS,
+        stream_task = asyncio.create_task(
+            _stream_events(process, text_parts, wrapped_on_event, on_permission, activity)
         )
-    except asyncio.TimeoutError:
+        result_text = await _wait_with_activity_timeout(stream_task, activity)
+    except _IdleTimeoutError:
         process.kill()
         await process.wait()
-        return f"Error: Claude timed out after {CLI_TIMEOUT_SECONDS} seconds."
+        idle_min = CLI_IDLE_TIMEOUT_SECONDS // 60
+        return f"Error: Claude timed out after {idle_min}m of inactivity."
+    except _HardTimeoutError:
+        process.kill()
+        await process.wait()
+        hard_min = CLI_TIMEOUT_SECONDS // 60
+        return f"Error: Claude hit the {hard_min}m hard timeout."
     except asyncio.CancelledError:
         process.kill()
         await process.wait()
@@ -210,6 +264,7 @@ async def _stream_events(
     text_parts: list[str],
     on_event: Callable[[StreamEvent], Any] | None,
     on_permission: Callable[[PermissionEvent], Any] | None,
+    activity: _ActivityTracker | None = None,
 ) -> str:
     """Read stream-json lines from stdout, dispatch events, return result text."""
     assert process.stdout
@@ -220,6 +275,9 @@ async def _stream_events(
         line = await process.stdout.readline()
         if not line:
             break
+
+        if activity:
+            activity.touch()
 
         raw = line.decode("utf-8", errors="replace").strip()
         if not raw:

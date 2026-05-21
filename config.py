@@ -29,4 +29,5 @@ POLL_INTERVAL_SECONDS: float = 2.5
 CLAUDE_HISTORY_FILE: Path = Path.home() / ".claude" / "history.jsonl"
 CLAUDE_PROJECTS_DIR: Path = Path.home() / ".claude" / "projects"
 MAX_SESSIONS_DISPLAYED: int = 10
-CLI_TIMEOUT_SECONDS: int = 300
+CLI_TIMEOUT_SECONDS: int = int(os.environ.get("CLI_TIMEOUT_SECONDS", "2400"))
+CLI_IDLE_TIMEOUT_SECONDS: int = int(os.environ.get("CLI_IDLE_TIMEOUT_SECONDS", "180"))
