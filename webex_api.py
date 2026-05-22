@@ -174,3 +174,14 @@ class WebexAPI:
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             logger.warning("Failed to edit message %s: %s", message_id, e)
             return None
+
+    async def delete_message(self, message_id: str) -> None:
+        """Delete a message. Failures are logged and swallowed."""
+        if self._client is None:
+            return
+        try:
+            response = await self._client.request("DELETE", f"/messages/{message_id}")
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            logger.warning("Failed to delete message %s: %s", message_id, e)
+

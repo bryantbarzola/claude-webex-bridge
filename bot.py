@@ -528,8 +528,8 @@ async def handle_cancel(api: WebexAPI, room_id: str) -> None:
     if process is not None:
         try:
             process.kill()
-            await process.wait()
-        except ProcessLookupError:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except (ProcessLookupError, asyncio.TimeoutError):
             pass
 
     if state._thinking_id:
@@ -616,6 +616,7 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
         if thinking_id:
             result = await api.edit_message(thinking_id, room_id, chunks[0])
             if result is None:
+                await api.delete_message(thinking_id)
                 await api.send_message(room_id, chunks[0])
         else:
             await api.send_message(room_id, chunks[0])
@@ -773,7 +774,6 @@ async def poll_loop(api: WebexAPI) -> None:
                         break
                     new_messages.append(msg)
 
-                last_seen[room_id] = newest_id
                 new_messages.reverse()
 
                 for msg in new_messages:
@@ -788,6 +788,8 @@ async def poll_loop(api: WebexAPI) -> None:
 
                     logger.info("Message from %s: %s", sender_email, text[:80])
                     await dispatch(api, room_id, text)
+
+                last_seen[room_id] = newest_id
 
         except SystemExit:
             raise

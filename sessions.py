@@ -36,7 +36,7 @@ def _find_session_file(session_id: str, project: str) -> Path | None:
 
 def _extract_cwd(session_path: Path) -> str:
     """Read the session JSONL and extract the cwd from the first user message."""
-    with open(session_path) as f:
+    with open(session_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -59,7 +59,7 @@ def list_recent_sessions(limit: int = MAX_SESSIONS_DISPLAYED) -> list[SessionInf
 
     # Collect the latest entry per session
     sessions: dict[str, dict] = {}
-    with open(CLAUDE_HISTORY_FILE) as f:
+    with open(CLAUDE_HISTORY_FILE, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
@@ -110,7 +110,7 @@ def get_session_by_id(session_id: str) -> SessionInfo | None:
 
     # Find the session in history
     target_entry = None
-    with open(CLAUDE_HISTORY_FILE) as f:
+    with open(CLAUDE_HISTORY_FILE, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:

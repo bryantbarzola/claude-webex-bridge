@@ -99,10 +99,10 @@ class _HardTimeoutError(Exception):
 
 class _ActivityTracker:
     def __init__(self) -> None:
-        self.last_activity: float = asyncio.get_event_loop().time()
+        self.last_activity: float = asyncio.get_running_loop().time()
 
     def touch(self) -> None:
-        self.last_activity = asyncio.get_event_loop().time()
+        self.last_activity = asyncio.get_running_loop().time()
 
 
 async def _wait_with_activity_timeout(
@@ -110,12 +110,12 @@ async def _wait_with_activity_timeout(
     activity: _ActivityTracker,
 ) -> str:
     """Wait for stream_task, enforcing idle timeout and hard cap."""
-    start = asyncio.get_event_loop().time()
+    start = asyncio.get_running_loop().time()
     check_interval = 5.0
 
     while not stream_task.done():
         await asyncio.sleep(check_interval)
-        now = asyncio.get_event_loop().time()
+        now = asyncio.get_running_loop().time()
 
         if now - start > CLI_TIMEOUT_SECONDS:
             stream_task.cancel()
@@ -238,17 +238,26 @@ async def send_message(
         result_text = await _wait_with_activity_timeout(stream_task, activity)
     except _IdleTimeoutError:
         process.kill()
-        await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
         idle_min = CLI_IDLE_TIMEOUT_SECONDS // 60
         return f"Error: Claude timed out after {idle_min}m of inactivity."
     except _HardTimeoutError:
         process.kill()
-        await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
         hard_min = CLI_TIMEOUT_SECONDS // 60
         return f"Error: Claude hit the {hard_min}m hard timeout."
     except asyncio.CancelledError:
         process.kill()
-        await process.wait()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            pass
         raise
 
     await process.wait()
