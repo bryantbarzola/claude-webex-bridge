@@ -15,6 +15,8 @@ from claude_cli import (
     send_message as cli_send_message,
 )
 from config import BOT_DISPLAY_NAME, BOT_TAGLINE, POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
+from mentions import strip_mention, thread_id_of
+from session_store import SessionStore
 from sessions import SessionInfo, get_session_by_id, list_recent_sessions
 from webex_api import WebexAPI
 
@@ -47,11 +49,38 @@ class BotState:
 
 _room_states: dict[str, BotState] = {}
 
+# Disk-backed thread_id -> claude session_id map for group-space conversations.
+_thread_sessions = SessionStore()
+
 
 def get_state(room_id: str) -> BotState:
     if room_id not in _room_states:
         _room_states[room_id] = BotState()
     return _room_states[room_id]
+
+
+async def handle_space_mention(api: WebexAPI, room_id: str, message: dict) -> None:
+    """Handle one @mention in a group space: resolve thread, resume/create its
+    Claude session, and reply in-thread. State is keyed by thread id so each
+    Webex thread has its own conversation context."""
+    thread = thread_id_of(message)
+    question = strip_mention(message.get("text", ""), message.get("html", ""), api.bot_display_name)
+    if not question:
+        return
+
+    state = get_state(thread)
+    existing = _thread_sessions.get(thread)
+    if existing:
+        state.session_id = existing
+        state.session_is_new = False
+    elif state.session_id is None:
+        state.session_id = generate_session_id()
+        state.session_is_new = True
+        state.session_cwd = str(Path.home())
+        _thread_sessions.create(thread, state.session_id)
+
+    logger.info("Space mention thread=%s: %s", thread[:12], question[:80])
+    await handle_text_message(api, room_id, question, state_key=thread, parent_id=thread)
 
 
 # ---------------------------------------------------------------------------
@@ -567,8 +596,11 @@ async def _update_thinking(api: WebexAPI, state: BotState, room_id: str, tool_ev
 # Text message handler (core loop)
 # ---------------------------------------------------------------------------
 
-async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
-    state = get_state(room_id)
+async def handle_text_message(
+    api: WebexAPI, room_id: str, text: str,
+    state_key: str | None = None, parent_id: str | None = None,
+) -> None:
+    state = get_state(state_key or room_id)
 
     if state.session_id is None:
         state.session_id = generate_session_id()
@@ -576,7 +608,7 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
         state.session_cwd = str(Path.home())
 
     if state.processing:
-        await api.send_message(room_id, "Still processing. Use `/cancel` to abort.")
+        await api.send_message(room_id, "Still processing. Use `/cancel` to abort.", parent_id=parent_id)
         return
 
     state.processing = True
@@ -586,7 +618,7 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
     tool_event = asyncio.Event()
 
     try:
-        thinking = await api.send_message(room_id, "Thinking...")
+        thinking = await api.send_message(room_id, "Thinking...", parent_id=parent_id)
         thinking_id = thinking.get("id")
         state._thinking_id = thinking_id
 
@@ -617,12 +649,12 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
             result = await api.edit_message(thinking_id, room_id, chunks[0])
             if result is None:
                 await api.delete_message(thinking_id)
-                await api.send_message(room_id, chunks[0])
+                await api.send_message(room_id, chunks[0], parent_id=parent_id)
         else:
-            await api.send_message(room_id, chunks[0])
+            await api.send_message(room_id, chunks[0], parent_id=parent_id)
 
         for chunk in chunks[1:]:
-            await api.send_message(room_id, chunk)
+            await api.send_message(room_id, chunk, parent_id=parent_id)
 
     except asyncio.CancelledError:
         pass
@@ -632,7 +664,7 @@ async def handle_text_message(api: WebexAPI, room_id: str, text: str) -> None:
         if thinking_id:
             await api.edit_message(thinking_id, room_id, error_text)
         else:
-            await api.send_message(room_id, error_text)
+            await api.send_message(room_id, error_text, parent_id=parent_id)
     finally:
         if updater_task is not None:
             updater_task.cancel()
@@ -744,6 +776,7 @@ async def poll_loop(api: WebexAPI) -> None:
         if msgs:
             last_seen[startup_room] = msgs[0]["id"]
 
+    _thread_sessions.cleanup()
     logger.info("Polling started (interval=%.1fs)", POLL_INTERVAL_SECONDS)
 
     while True:
@@ -788,6 +821,44 @@ async def poll_loop(api: WebexAPI) -> None:
 
                     logger.info("Message from %s: %s", sender_email, text[:80])
                     await dispatch(api, room_id, text)
+
+                last_seen[room_id] = newest_id
+
+            # --- group spaces (mention-driven) ---
+            try:
+                group_rooms = await api.list_group_rooms(max_rooms=50)
+            except Exception:
+                group_rooms = []
+
+            for room in group_rooms:
+                room_id = room["id"]
+                mentions = await api.list_mentions(room_id, max_messages=10)
+                if not mentions:
+                    continue
+
+                newest_id = mentions[0]["id"]
+
+                if room_id not in initialized_rooms:
+                    initialized_rooms.add(room_id)
+                    last_seen[room_id] = newest_id
+                    logger.info("Initialized space %s", room_id[:12])
+                    continue
+
+                if last_seen.get(room_id) == newest_id:
+                    continue
+
+                new_mentions = []
+                for msg in mentions:
+                    if msg["id"] == last_seen.get(room_id):
+                        break
+                    new_mentions.append(msg)
+
+                new_mentions.reverse()
+
+                for msg in new_mentions:
+                    if msg.get("personId") == api.bot_id:
+                        continue
+                    await handle_space_mention(api, room_id, msg)
 
                 last_seen[room_id] = newest_id
 
