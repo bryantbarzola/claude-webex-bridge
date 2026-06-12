@@ -44,22 +44,22 @@ class SessionStore:
         os.replace(tmp, self._path)
 
     def get(self, thread_id: str) -> str | None:
+        """Pure read: return the session id, or None if missing/expired.
+
+        Does not write to disk. Expiry is based on `created`; an expired entry
+        is reported as missing here and physically removed by cleanup().
+        """
         entry = self._data.get(thread_id)
         if entry is None:
             return None
         if time.time() - entry["created"] > TTL_SECONDS:
-            del self._data[thread_id]
-            self._save()
             return None
-        entry["last_used"] = time.time()
-        self._save()
         return entry["session_id"]
 
     def create(self, thread_id: str, session_id: str) -> None:
         self._data[thread_id] = {
             "session_id": session_id,
             "created": time.time(),
-            "last_used": time.time(),
         }
         self._save()
 

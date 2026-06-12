@@ -104,3 +104,17 @@ def test_cleanup_returns_empty_when_nothing_expired(tmp_path):
     s = SessionStore(path=tmp_path / "s.json")
     s.create("fresh", "u1")
     assert s.cleanup() == []
+
+
+def test_get_is_a_pure_read_no_disk_write(tmp_path):
+    # get() must not write to disk on the hot path (every mention calls it).
+    p = tmp_path / "s.json"
+    s = SessionStore(path=p)
+    s.create("t", "uuid-1")
+    mtime_before = p.stat().st_mtime_ns
+    calls = {"n": 0}
+    orig_save = s._save
+    s._save = lambda: (calls.__setitem__("n", calls["n"] + 1), orig_save())[1]
+    assert s.get("t") == "uuid-1"
+    assert calls["n"] == 0, "get() must not call _save()"
+    assert p.stat().st_mtime_ns == mtime_before, "get() must not modify the file"

@@ -80,6 +80,10 @@ async def handle_space_mention(api: WebexAPI, room_id: str, message: dict) -> No
     if existing:
         state.session_id = existing
         state.session_is_new = False
+        # After a restart this BotState is fresh (cwd=None); ensure a valid cwd
+        # since handle_text_message only initializes it when session_id is None.
+        if state.session_cwd is None:
+            state.session_cwd = str(Path.home())
     elif state.session_id is None:
         state.session_id = generate_session_id()
         state.session_is_new = True
