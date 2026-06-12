@@ -63,7 +63,9 @@ class SessionStore:
         }
         self._save()
 
-    def cleanup(self):
+    def cleanup(self) -> list[str]:
+        """Remove expired entries; return the list of evicted thread ids so
+        callers can drop matching in-memory state."""
         now = time.time()
         expired = [k for k, v in self._data.items() if now - v["created"] > TTL_SECONDS]
         for k in expired:
@@ -71,3 +73,4 @@ class SessionStore:
         if expired:
             self._save()
             logger.info("Cleaned up %d expired sessions", len(expired))
+        return expired

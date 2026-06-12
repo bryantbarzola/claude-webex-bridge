@@ -85,3 +85,22 @@ def test_cleanup_removes_expired(tmp_path):
     s.cleanup()
     assert s.get("old") is None
     assert s.get("new") == "u2"
+
+
+def test_cleanup_returns_expired_keys(tmp_path):
+    # cleanup reports which threads it evicted so callers can drop matching
+    # in-memory state (e.g. bot._room_states).
+    p = tmp_path / "s.json"
+    s = SessionStore(path=p)
+    s.create("old", "u1")
+    s.create("new", "u2")
+    s._data["old"]["created"] = time.time() - (49 * 3600)
+    s._save()
+    expired = s.cleanup()
+    assert expired == ["old"]
+
+
+def test_cleanup_returns_empty_when_nothing_expired(tmp_path):
+    s = SessionStore(path=tmp_path / "s.json")
+    s.create("fresh", "u1")
+    assert s.cleanup() == []
