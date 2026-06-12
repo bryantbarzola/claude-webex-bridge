@@ -181,20 +181,13 @@ class WebexAPI:
             },
         )
 
-    async def edit_message(self, message_id: str, room_id: str, text: str, parent_id: str | None = None) -> dict | None:
-        """Edit an existing message. Returns None on failure (caller should fallback).
-
-        parent_id is accepted for a uniform call signature with send_message; Webex
-        ignores it when editing an existing message.
-        """
-        payload = {"roomId": room_id, "markdown": text}
-        if parent_id:
-            payload["parentId"] = parent_id
+    async def edit_message(self, message_id: str, room_id: str, text: str) -> dict | None:
+        """Edit an existing message. Returns None on failure (caller should fallback)."""
         try:
             return await self._request(
                 "PUT",
                 f"/messages/{message_id}",
-                json=payload,
+                json={"roomId": room_id, "markdown": text},
             )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             logger.warning("Failed to edit message %s: %s", message_id, e)
