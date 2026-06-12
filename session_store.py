@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -33,8 +34,14 @@ class SessionStore:
                 self._data = {}
 
     def _save(self):
+        # Atomic write: serialize to a temp file in the same dir, then rename
+        # over the target. os.replace is atomic on POSIX, so a crash mid-write
+        # can never truncate the existing store — readers see old or new, never
+        # a partial file.
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        self._path.write_text(json.dumps(self._data, indent=2))
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        tmp.write_text(json.dumps(self._data, indent=2))
+        os.replace(tmp, self._path)
 
     def get(self, thread_id: str) -> str | None:
         entry = self._data.get(thread_id)
