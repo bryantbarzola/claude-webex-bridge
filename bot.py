@@ -59,6 +59,13 @@ def get_state(room_id: str) -> BotState:
     return _room_states[room_id]
 
 
+def _cleanup_expired_sessions() -> None:
+    """Evict expired thread sessions from disk AND their in-memory BotState,
+    so _room_states does not grow without bound on a long-running bot."""
+    for thread in _thread_sessions.cleanup():
+        _room_states.pop(thread, None)
+
+
 async def handle_space_mention(api: WebexAPI, room_id: str, message: dict) -> None:
     """Handle one @mention in a group space: resolve thread, resume/create its
     Claude session, and reply in-thread. State is keyed by thread id so each
@@ -776,11 +783,17 @@ async def poll_loop(api: WebexAPI) -> None:
         if msgs:
             last_seen[startup_room] = msgs[0]["id"]
 
-    _thread_sessions.cleanup()
+    _cleanup_expired_sessions()
+    last_cleanup = time.monotonic()
     logger.info("Polling started (interval=%.1fs)", POLL_INTERVAL_SECONDS)
 
     while True:
         try:
+            # Periodic eviction of expired thread sessions + their in-memory state.
+            if time.monotonic() - last_cleanup > 3600:
+                _cleanup_expired_sessions()
+                last_cleanup = time.monotonic()
+
             rooms = await api.list_direct_rooms(max_rooms=50)
 
             for room in rooms:
