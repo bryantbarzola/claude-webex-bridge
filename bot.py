@@ -14,7 +14,7 @@ from claude_cli import (
     generate_session_id,
     send_message as cli_send_message,
 )
-from config import BOT_DISPLAY_NAME, BOT_TAGLINE, POLL_INTERVAL_SECONDS, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
+from config import BOT_DISPLAY_NAME, BOT_TAGLINE, POLL_INTERVAL_SECONDS, SPACE_MODES, WEBEX_MAX_MESSAGE_BYTES, WEBEX_USER_EMAIL
 from mentions import strip_mention, thread_id_of
 from session_store import SessionStore
 from sessions import SessionInfo, get_session_by_id, list_recent_sessions
@@ -90,7 +90,12 @@ async def handle_space_mention(api: WebexAPI, room_id: str, message: dict) -> No
         state.session_cwd = str(Path.home())
         _thread_sessions.create(thread, state.session_id)
 
-    logger.info("Space mention thread=%s: %s", thread[:12], question[:80])
+    # Per-space permission level: listed spaces use their configured mode,
+    # every other space defaults to read-only (strict). Operator-controlled;
+    # never escalatable from chat.
+    state.mode = SPACE_MODES.get(room_id, PermissionMode.STRICT)
+
+    logger.info("Space mention thread=%s mode=%s: %s", thread[:12], state.mode, question[:80])
     await handle_text_message(api, room_id, question, state_key=thread, parent_id=thread)
 
 
