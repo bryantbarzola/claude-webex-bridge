@@ -18,6 +18,7 @@ class WebexAPI:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self.bot_id: str | None = None
+        self.bot_display_name: str = ""
 
     async def start(self) -> None:
         """Initialize the HTTP client, verify the token, and cache bot_id."""
@@ -31,8 +32,8 @@ class WebexAPI:
         )
         data = await self._request("GET", "/people/me")
         self.bot_id = data["id"]
-        display_name = data.get("displayName", "Unknown")
-        logger.info("Bot authenticated as: %s (id=%s)", display_name, self.bot_id)
+        self.bot_display_name = data.get("displayName", "")
+        logger.info("Bot authenticated as: %s (id=%s)", self.bot_display_name or "Unknown", self.bot_id)
 
     async def close(self) -> None:
         """Close the httpx client."""
@@ -112,6 +113,15 @@ class WebexAPI:
         )
         return data.get("items", [])
 
+    async def list_group_rooms(self, max_rooms: int = 50) -> list[dict]:
+        """List group (space) rooms the bot belongs to, sorted by last activity."""
+        data = await self._request(
+            "GET",
+            "/rooms",
+            params={"type": "group", "sortBy": "lastactivity", "max": str(max_rooms)},
+        )
+        return data.get("items", [])
+
     async def list_messages(self, room_id: str, max_messages: int = 10) -> list[dict]:
         """List messages in a room (newest first)."""
         data = await self._request(
@@ -121,13 +131,21 @@ class WebexAPI:
         )
         return data.get("items", [])
 
-    async def send_message(self, room_id: str, text: str) -> dict:
-        """Send a text message to a room."""
-        return await self._request(
-            "POST",
+    async def list_mentions(self, room_id: str, max_messages: int = 10) -> list[dict]:
+        """List messages in a room that @mention this bot (newest first)."""
+        data = await self._request(
+            "GET",
             "/messages",
-            json={"roomId": room_id, "markdown": text},
+            params={"roomId": room_id, "mentionedPeople": "me", "max": str(max_messages)},
         )
+        return data.get("items", [])
+
+    async def send_message(self, room_id: str, text: str, parent_id: str | None = None) -> dict:
+        """Send a text message to a room, optionally as a threaded reply."""
+        payload = {"roomId": room_id, "markdown": text}
+        if parent_id:
+            payload["parentId"] = parent_id
+        return await self._request("POST", "/messages", json=payload)
 
     async def send_card_message(self, room_id: str, card: dict, fallback_text: str) -> dict:
         """Send a message with an Adaptive Card attachment."""
@@ -163,13 +181,20 @@ class WebexAPI:
             },
         )
 
-    async def edit_message(self, message_id: str, room_id: str, text: str) -> dict | None:
-        """Edit an existing message. Returns None on failure (caller should fallback)."""
+    async def edit_message(self, message_id: str, room_id: str, text: str, parent_id: str | None = None) -> dict | None:
+        """Edit an existing message. Returns None on failure (caller should fallback).
+
+        parent_id is accepted for a uniform call signature with send_message; Webex
+        ignores it when editing an existing message.
+        """
+        payload = {"roomId": room_id, "markdown": text}
+        if parent_id:
+            payload["parentId"] = parent_id
         try:
             return await self._request(
                 "PUT",
                 f"/messages/{message_id}",
-                json={"roomId": room_id, "markdown": text},
+                json=payload,
             )
         except (httpx.HTTPStatusError, httpx.RequestError) as e:
             logger.warning("Failed to edit message %s: %s", message_id, e)
